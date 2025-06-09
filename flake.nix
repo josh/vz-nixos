@@ -37,7 +37,13 @@
         in
         {
           inherit (self.packages.aarch64-darwin) vz-nixos;
+        };
 
+      checks.aarch64-darwin-virt =
+        let
+          pkgs = nixpkgs.legacyPackages.aarch64-darwin;
+        in
+        {
           minimal-boot = pkgs.callPackage ./nix/pkgs/minimal-boot-check.nix {
             inherit (self.packages.aarch64-darwin) vz-nixos;
             nixosToplevel = self.nixosConfigurations.minimal.config.system.build.toplevel;
