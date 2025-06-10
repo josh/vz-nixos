@@ -18,6 +18,8 @@ runCommand "minimal-boot"
       jq
       vz-nixos
     ];
+    requiredSystemFeatures = [ "apple-virt" ];
+    meta.platforms = [ "aarch64-darwin" ];
   }
   ''
     vz-nixos ${config} 2>&1 | tee boot.log || true
