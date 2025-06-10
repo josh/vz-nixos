@@ -9,6 +9,8 @@ extension Configuration {
     case invalidInterfaceIdentifier(String)
     case missingSocketPath
     case invalidSocketPath(String)
+    case socketCreationFailed
+    case socketConnectionFailed
   }
 
   static func load(from url: URL) throws -> Configuration {
@@ -105,11 +107,11 @@ extension Configuration {
         return configuration
 
       case .socket:
-        guard let socketFileDescriptor = deviceConfiguration.socketFileDescriptor else {
+        guard let socketPath = deviceConfiguration.socketPath else {
           throw Error.missingSocketPath
         }
 
-        let fileHandle = FileHandle(fileDescriptor: socketFileDescriptor, closeOnDealloc: true)
+        let fileHandle = try createQEMUSocketBridge(socketPath: socketPath)
         let configuration = VZVirtioNetworkDeviceConfiguration()
         configuration.attachment = VZFileHandleNetworkDeviceAttachment(fileHandle: fileHandle)
         if let macAddress {
@@ -148,5 +150,133 @@ extension Configuration {
     consoleConfiguration.attachment = stdioAttachment
 
     return consoleConfiguration
+  }
+
+  private func createQEMUSocketBridge(socketPath: String) throws -> FileHandle {
+    var sockets: [Int32] = [0, 0]
+    guard socketpair(AF_UNIX, SOCK_DGRAM, 0, &sockets) == 0 else {
+      throw Error.socketCreationFailed
+    }
+    
+    let vzSocket = sockets[0]
+    let bridgeSocket = sockets[1]
+    
+    let qemuSocket = socket(AF_UNIX, SOCK_STREAM, 0)
+    guard qemuSocket != -1 else {
+      close(vzSocket)
+      close(bridgeSocket)
+      throw Error.socketCreationFailed
+    }
+    
+    var addr = sockaddr_un()
+    addr.sun_family = sa_family_t(AF_UNIX)
+    let pathBytes = socketPath.utf8CString
+    guard pathBytes.count <= MemoryLayout.size(ofValue: addr.sun_path) else {
+      close(vzSocket)
+      close(bridgeSocket)
+      close(qemuSocket)
+      throw Error.invalidSocketPath(socketPath)
+    }
+    
+    withUnsafeMutableBytes(of: &addr.sun_path) { ptr in
+      pathBytes.withUnsafeBytes { pathPtr in
+        ptr.copyMemory(from: pathPtr)
+      }
+    }
+    
+    let addrSize = MemoryLayout<sa_family_t>.size + pathBytes.count
+    let connectResult = withUnsafePointer(to: &addr) { ptr in
+      ptr.withMemoryRebound(to: sockaddr.self, capacity: 1) { sockPtr in
+        connect(qemuSocket, sockPtr, socklen_t(addrSize))
+      }
+    }
+    
+    guard connectResult == 0 else {
+      close(vzSocket)
+      close(bridgeSocket)
+      close(qemuSocket)
+      throw Error.socketConnectionFailed
+    }
+    
+    Task {
+      await bridgeQEMUProtocol(vzSocket: bridgeSocket, qemuSocket: qemuSocket)
+    }
+    
+    return FileHandle(fileDescriptor: vzSocket, closeOnDealloc: true)
+  }
+  
+  private func bridgeQEMUProtocol(vzSocket: Int32, qemuSocket: Int32) async {
+    await withTaskGroup(of: Void.self) { group in
+      // VZ -> QEMU (add length header)
+      group.addTask {
+        var buffer = Data(count: 65536)
+        while true {
+          let bytesRead = buffer.withUnsafeMutableBytes { ptr in
+            recv(vzSocket, ptr.baseAddress, ptr.count, 0)
+          }
+          
+          guard bytesRead > 0 else { break }
+          
+          let packet = buffer.prefix(bytesRead)
+          
+          // Send length header (4 bytes, big endian)
+          var length = UInt32(bytesRead).bigEndian
+          let headerSent = withUnsafeBytes(of: &length) { ptr in
+            send(qemuSocket, ptr.baseAddress, ptr.count, 0)
+          }
+          
+          guard headerSent == 4 else { break }
+          
+          // Send packet data
+          let dataSent = packet.withUnsafeBytes { ptr in
+            send(qemuSocket, ptr.baseAddress, ptr.count, 0)
+          }
+          
+          guard dataSent == bytesRead else { break }
+        }
+      }
+      
+      // QEMU -> VZ (remove length header)
+      group.addTask {
+        while true {
+          // Read length header
+          var lengthBuffer = Data(count: 4)
+          let headerBytes = lengthBuffer.withUnsafeMutableBytes { ptr in
+            recv(qemuSocket, ptr.baseAddress, ptr.count, MSG_WAITALL)
+          }
+          
+          guard headerBytes == 4 else { break }
+          
+          let length = lengthBuffer.withUnsafeBytes { ptr in
+            ptr.load(as: UInt32.self).bigEndian
+          }
+          
+          guard length > 0 && length <= 65536 else { break }
+          
+          // Read packet data
+          var packetBuffer = Data(count: Int(length))
+          let packetBytes = packetBuffer.withUnsafeMutableBytes { ptr in
+            recv(qemuSocket, ptr.baseAddress, ptr.count, MSG_WAITALL)
+          }
+          
+          guard packetBytes == length else { break }
+          
+          // Send to VZ (without header)
+          let sent = packetBuffer.withUnsafeBytes { ptr in
+            send(vzSocket, ptr.baseAddress, ptr.count, 0)
+          }
+          
+          guard sent == length else { break }
+        }
+      }
+      
+      // Wait for either direction to complete (indicating connection closed)
+      await group.next()
+      group.cancelAll()
+    }
+    
+    // Cleanup
+    close(vzSocket)
+    close(qemuSocket)
   }
 }
